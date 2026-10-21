@@ -174,21 +174,49 @@ def write_script(transcript, opts):
     return script
 
 
+
 async def create_voice(script, voice, audio_path, srt_path):
-    communicate = edge_tts.Communicate(script, voice)
-    submaker = edge_tts.SubMaker()
+    if not script or not script.strip():
+        raise RuntimeError("AI narration စာသား အလွတ်ဖြစ်နေပါတယ်။")
 
-    with open(audio_path, "wb") as audio_file:
-        async for chunk in communicate.stream():
-            if chunk["type"] == "audio":
-                audio_file.write(chunk["data"])
-            elif chunk["type"] == "WordBoundary":
-                submaker.feed(chunk)
+    audio_path.parent.mkdir(parents=True, exist_ok=True)
 
-    srt_path.write_text(submaker.get_srt(), encoding="utf-8")
+    try:
+        communicate = edge_tts.Communicate(
+            script.strip(),
+            voice
+        )
+        submaker = edge_tts.SubMaker()
+        audio_size = 0
 
-    if not audio_path.exists() or audio_path.stat().st_size == 0:
-        raise RuntimeError("AI အသံဖိုင် မထုတ်နိုင်ပါ။")
+        with open(audio_path, "wb") as audio_file:
+            async for chunk in communicate.stream():
+                if chunk["type"] == "audio":
+                    audio_file.write(chunk["data"])
+                    audio_size += len(chunk["data"])
+                elif chunk["type"] == "WordBoundary":
+                    submaker.feed(chunk)
+
+        if audio_size == 0:
+            raise RuntimeError(
+                "Edge TTS မှ အသံဒေတာ မရရှိပါ။ "
+                f"အသုံးပြုထားသော voice: {voice}"
+            )
+
+        srt_path.write_text(
+            submaker.get_srt(),
+            encoding="utf-8"
+        )
+
+    except Exception as exc:
+        if audio_path.exists():
+            audio_path.unlink()
+
+        raise RuntimeError(
+            f"Edge TTS အသံထုတ်လုပ်မှု မအောင်မြင်ပါ။ "
+            f"Voice={voice}; Error={type(exc).__name__}: {exc}"
+        ) from exc
+
 
 
 def process(job_id, video, opts):
