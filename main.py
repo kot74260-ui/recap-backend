@@ -130,7 +130,7 @@ def write_script(transcript, opts):
             "Content-Type": "application/json",
         },
         json={
-            "model": "openai/gpt-oss-120b
+            "model": "openai/gpt-oss-120b",
             "messages": [
                 {
                     "role": "system",
