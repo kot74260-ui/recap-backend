@@ -124,3 +124,6 @@ def job_status(job_id: str):
 @app.get("/api/jobs/{job_id}/result")
 def job_result(job_id: str):
     return FileResponse(WORK / job_id / "out.mp4", media_type="video/mp4", filename="recap.mp4")
+    @app.get("/")
+def home():
+    return FileResponse("index.html")
