@@ -183,29 +183,52 @@ def transcribe(video, folder):
 
 # ---------------- TRANSLATION / RECAP ----------------
 
+
 def write_script(transcript, opts):
     key = os.environ.get("GROQ_API_KEY")
     if not key:
         raise RuntimeError("GROQ_API_KEY မသတ်မှတ်ထားပါ။")
 
-    lang = opts["lang"]
+    if not transcript or not transcript.strip():
+        raise RuntimeError("မူရင်းစာသား မရရှိပါ။")
 
-    if opts["mode"].lower() == "translate":
-        task = (
-            f"Translate the following transcript into {lang}. "
-            "You are an expert Myanmar movie recap scriptwriter and translator. "
-            "If the target language is Burmese, write in natural, fluent Burmese Unicode "
-            "that sounds like a real Myanmar narrator telling a movie story. "
-            "Do not translate word-for-word. Rewrite awkward expressions into natural Burmese "
-            "while preserving the original meaning, character names, events, and event order. "
-            "Use conversational movie-recap narration, consistent pronouns, correct grammar, "
-            "and proper Myanmar spelling. "
-            "Never produce unnatural phrases, broken sentences, duplicated words, or grammar errors. "
-            "Keep each sentence complete and easy to understand when spoken aloud. "
-            "Do not split one sentence awkwardly across unrelated lines. "
-            "Do not invent events or omit important details. "
-            "Return only the translated narration, without explanations or headings."
+    lang = opts.get("lang", "Burmese")
+    mode = opts.get("mode", "translate").lower()
+    style = opts.get("style", "Fast Recap")
+
+    # အဓိကရည်ရွယ်ချက်မှာ မြန်မာစာသားကို သဘာဝကျအောင် ပြန်ရေးရန်ဖြစ်သည်။
+    task = """
+You are a professional multilingual translator and Myanmar movie recap writer.
+
+MAIN REQUIREMENT:
+Convert the provided transcript into natural, fluent Myanmar Burmese Unicode.
+This requirement applies regardless of the source language.
+
+RULES:
+1. Understand the original meaning before translating.
+2. Write natural Myanmar Burmese as a real Myanmar narrator would speak.
+3. Do not translate word-for-word.
+4. Preserve names, characters, events, facts and event order.
+5. Use correct Myanmar grammar, spelling, vocabulary and sentence structure.
+6. Rewrite awkward expressions into clear, natural Burmese.
+7. Never invent missing events or change the story.
+8. Do not add English explanations, headings, notes or translator comments.
+9. Avoid repeated sentences, broken phrases and unnatural machine translation.
+10. Make sentences easy to understand when spoken aloud.
+11. If a source phrase is unclear, do not guess a new event. Translate only
+    the meaning that can reasonably be understood from the context.
+12. Return only the finished Myanmar narration.
+
+The final narration must be in Myanmar Burmese Unicode, not English.
+"""
+
+    if mode != "translate":
+        task += (
+            "\nWrite in engaging movie recap narration style. "
+            "Keep the important story details and their original order.\n"
         )
+
+    task += f"\nNarration style: {style}\n"
 
     response = httpx.post(
         "https://api.groq.com/openai/v1/chat/completions",
@@ -218,20 +241,19 @@ def write_script(transcript, opts):
             "messages": [
                 {
                     "role": "system",
-                    "content": (
-                        "You are an expert movie translator and recap writer. "
-                        "Preserve meaning. Do not invent events."
-                    ),
+                    "content": task,
                 },
                 {
                     "role": "user",
                     "content": (
-                        f"{task}\nTarget language: {lang}\n\n"
-                        f"Transcript:\n{transcript[:20000]}"
+                        "အောက်ပါမူရင်းအသံမှ ရရှိထားသော စာသားကို "
+                        "အဓိပ္ပာယ်မပျက်စေဘဲ သဘာဝကျသော မြန်မာဘာသာဖြင့် "
+                        "ပြန်ရေးပေးပါ။ မြန်မာစာသားကိုသာ ပြန်ပေးပါ။\n\n"
+                        + transcript[:20000]
                     ),
                 },
             ],
-            "temperature": 0.4,
+            "temperature": 0.2,
             "max_tokens": 6000,
         },
         timeout=180,
@@ -243,16 +265,15 @@ def write_script(transcript, opts):
             f"{response.text[:1000]}"
         )
 
+    data = response.json()
+    choices = data.get("choices", [])
     script = (
-        response.json()
-        .get("choices", [{}])[0]
-        .get("message", {})
-        .get("content", "")
-        .strip()
+        choices[0].get("message", {}).get("content", "").strip()
+        if choices else ""
     )
 
     if not script:
-        raise RuntimeError("AI မှ စာသားမရရှိပါ။")
+        raise RuntimeError("AI မှ မြန်မာစာသား မရရှိပါ။")
 
     return script
 
