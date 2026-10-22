@@ -662,3 +662,15 @@ def job_result(job_id: str):
         media_type="video/mp4",
         filename="recap.mp4",
     )
+
+@app.get("/api/jobs/{job_id}/transcript")
+def job_transcript(job_id: str):
+    path = WORK / job_id / "transcript.txt"
+    if not path.is_file():
+        raise HTTPException(404, "Original transcript is not ready.")
+    return FileResponse(
+        path,
+        media_type="text/plain; charset=utf-8",
+        filename="original_transcript.txt",
+    )
+    
