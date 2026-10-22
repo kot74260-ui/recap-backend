@@ -1,4 +1,3 @@
-
 import asyncio
 import json
 import logging
@@ -17,11 +16,7 @@ from fastapi import (
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse
 
-# --------------------------------------------------
-# TZ RECAP API
-# --------------------------------------------------
-
-app = FastAPI(title="TZ Recap API", version="2.1.0")
+app = FastAPI(title="TZ Recap API", version="2.2.0")
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("tz-recap")
@@ -35,11 +30,12 @@ app.add_middleware(
 
 WORK = Path("jobs")
 WORK.mkdir(parents=True, exist_ok=True)
-
 STATE_FILE = WORK / "job_state.json"
+
 JOBS = {}
 JOB_LOCK = threading.RLock()
 
+MAX_UPLOAD = 100 * 1024 * 1024
 
 VOICES = {
     "Thiha · Male (Burmese)": "my-MM-ThihaNeural",
@@ -56,33 +52,25 @@ STYLES = {
 }
 
 ACTIVE_STATUSES = {
-    "queued",
-    "transcribing",
-    "writing_script",
-    "generating_voice",
-    "rendering",
+    "queued", "transcribing", "writing_script",
+    "generating_voice", "rendering",
 }
 
 
-# --------------------------------------------------
-# JOB STATE STORAGE
-# --------------------------------------------------
+# ---------------- JOB STORAGE ----------------
 
 def save_jobs_unlocked():
-    """Write job state atomically to a JSON file."""
-    temp_file = STATE_FILE.with_suffix(".tmp")
-    temp_file.write_text(
-        json.dumps(JOBS, ensure_ascii=False, indent=2),
+    temp = STATE_FILE.with_suffix(".tmp")
+    temp.write_text(
+        json.dumps(JOBS, ensure_ascii=False),
         encoding="utf-8",
     )
-    temp_file.replace(STATE_FILE)
+    temp.replace(STATE_FILE)
 
 
 def update_job(job_id, **changes):
     with JOB_LOCK:
-        if job_id not in JOBS:
-            JOBS[job_id] = {}
-
+        JOBS.setdefault(job_id, {})
         JOBS[job_id].update(changes)
         save_jobs_unlocked()
 
@@ -90,106 +78,91 @@ def update_job(job_id, **changes):
 def load_jobs():
     if not STATE_FILE.exists():
         return
-
     try:
         data = json.loads(STATE_FILE.read_text(encoding="utf-8"))
         if isinstance(data, dict):
             JOBS.update(data)
-    except (OSError, ValueError) as exc:
-        logger.error("Could not load saved jobs: %s", exc)
+    except (OSError, ValueError):
+        logger.exception("Could not load job state")
 
 
 load_jobs()
 
-# A process restart cannot resume an interrupted FFmpeg task.
-# Mark interrupted jobs clearly instead of leaving them at 85%.
-for _job_id, _job in list(JOBS.items()):
-    if _job.get("status") in ACTIVE_STATUSES:
-        _job.update(
+for job in JOBS.values():
+    if job.get("status") in ACTIVE_STATUSES:
+        job.update(
             status="error",
             progress=0,
-            error=(
-                "Server restarted before processing finished. "
-                "Please upload the video again."
-            ),
+            error="Server restarted during processing. Please upload again.",
         )
 
 with JOB_LOCK:
     try:
         save_jobs_unlocked()
     except OSError:
-        logger.exception("Could not save initial job state")
+        logger.exception("Could not save job state")
 
 
-# --------------------------------------------------
-# SUBPROCESS / MEDIA HELPERS
-# --------------------------------------------------
+# ---------------- COMMAND HELPERS ----------------
 
 def run(cmd, timeout=900):
     logger.info("Running command: %s", cmd[0])
 
     result = subprocess.run(
         cmd,
-        capture_output=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
         text=True,
         timeout=timeout,
     )
 
     if result.returncode != 0:
-        details = (result.stderr or result.stdout or "Command failed")
-        raise RuntimeError(details[-3000:])
+        details = result.stderr or result.stdout or "Command failed"
+        raise RuntimeError(details[-2000:])
 
     return result
 
 
 def duration(path):
     result = run([
-        "ffprobe",
-        "-v", "error",
+        "ffprobe", "-v", "error",
         "-show_entries", "format=duration",
-        "-of", "csv=p=0",
-        str(path),
-    ])
+        "-of", "csv=p=0", str(path),
+    ], timeout=60)
 
     try:
         value = float(result.stdout.strip())
     except (ValueError, TypeError):
-        raise RuntimeError(f"Could not read media duration: {path}")
+        raise RuntimeError("Could not read media duration")
 
     if value <= 0:
-        raise RuntimeError(f"Invalid media duration: {path}")
+        raise RuntimeError("Invalid media duration")
 
     return value
 
 
-# --------------------------------------------------
-# TRANSCRIBE VIDEO AUDIO WITH GROQ
-# --------------------------------------------------
+# ---------------- GROQ TRANSCRIPTION ----------------
 
 def transcribe(video, folder):
-    api_key = os.environ.get("GROQ_API_KEY")
-
-    if not api_key:
-        raise RuntimeError(
-            "Render Environment တွင် GROQ_API_KEY မရှိပါ။"
-        )
+    key = os.environ.get("GROQ_API_KEY")
+    if not key:
+        raise RuntimeError("Render Environment တွင် GROQ_API_KEY မရှိပါ။")
 
     audio = folder / "audio_small.mp3"
 
     run([
         "ffmpeg", "-y",
+        "-threads", "1",
         "-i", str(video),
-        "-vn",
-        "-ac", "1",
-        "-ar", "16000",
+        "-vn", "-ac", "1", "-ar", "16000",
         "-b:a", "32k",
         str(audio),
-    ])
+    ], timeout=900)
 
     with open(audio, "rb") as f:
         response = httpx.post(
             "https://api.groq.com/openai/v1/audio/transcriptions",
-            headers={"Authorization": f"Bearer {api_key}"},
+            headers={"Authorization": f"Bearer {key}"},
             data={"model": "whisper-large-v3"},
             files={"file": ("audio.mp3", f, "audio/mpeg")},
             timeout=300,
@@ -198,49 +171,45 @@ def transcribe(video, folder):
     if response.is_error:
         raise RuntimeError(
             f"Groq transcription error {response.status_code}: "
-            f"{response.text[:1500]}"
+            f"{response.text[:1000]}"
         )
 
     transcript = response.json().get("text", "").strip()
-
     if not transcript:
         raise RuntimeError("ဗီဒီယိုထဲမှ အသံစာသား မရရှိပါ။")
 
     return transcript
 
 
-# --------------------------------------------------
-# WRITE TRANSLATION / RECAP SCRIPT
-# --------------------------------------------------
+# ---------------- TRANSLATION / RECAP ----------------
 
 def write_script(transcript, opts):
-    api_key = os.environ.get("GROQ_API_KEY")
-
-    if not api_key:
+    key = os.environ.get("GROQ_API_KEY")
+    if not key:
         raise RuntimeError("GROQ_API_KEY မသတ်မှတ်ထားပါ။")
 
     lang = opts["lang"]
 
-    if opts["mode"].strip().lower() == "translate":
+    if opts["mode"].lower() == "translate":
         task = (
-            f"Translate the following transcript into {lang}. "
-            "Preserve the original meaning, names and sequence. "
-            "If the target language is Burmese, use natural Burmese Unicode. "
-            "Return the translation only."
+            f"Translate this transcript into {lang}. "
+            "Preserve meaning, names, and event order. "
+            "For Burmese, use natural Burmese Unicode. "
+            "Return only the translation."
         )
     else:
         task = (
-            f"Write a compelling movie recap narration in {lang}. "
+            f"Write a compelling movie recap in {lang}. "
             f"{STYLES.get(opts['style'], STYLES['Fast Recap'])} "
-            "Keep the story events in the correct order. "
-            "Use natural Burmese Unicode when the target is Burmese. "
-            "Return narration only, without headings or explanations."
+            "Preserve the original event order. "
+            "Use natural Burmese Unicode when appropriate. "
+            "Return narration only."
         )
 
     response = httpx.post(
         "https://api.groq.com/openai/v1/chat/completions",
         headers={
-            "Authorization": f"Bearer {api_key}",
+            "Authorization": f"Bearer {key}",
             "Content-Type": "application/json",
         },
         json={
@@ -250,14 +219,13 @@ def write_script(transcript, opts):
                     "role": "system",
                     "content": (
                         "You are an expert movie translator and recap writer. "
-                        "Preserve meaning and never invent missing events."
+                        "Preserve meaning. Do not invent events."
                     ),
                 },
                 {
                     "role": "user",
                     "content": (
-                        f"{task}\n"
-                        f"Target language: {lang}\n\n"
+                        f"{task}\nTarget language: {lang}\n\n"
                         f"Transcript:\n{transcript[:20000]}"
                     ),
                 },
@@ -271,30 +239,28 @@ def write_script(transcript, opts):
     if response.is_error:
         raise RuntimeError(
             f"Groq writing error {response.status_code}: "
-            f"{response.text[:1500]}"
+            f"{response.text[:1000]}"
         )
 
-    data = response.json()
     script = (
-        data.get("choices", [{}])[0]
+        response.json()
+        .get("choices", [{}])[0]
         .get("message", {})
         .get("content", "")
         .strip()
     )
 
     if not script:
-        raise RuntimeError("AI မှ narration စာသား မရရှိပါ။")
+        raise RuntimeError("AI မှ စာသားမရရှိပါ။")
 
     return script
 
 
-# --------------------------------------------------
-# GENERATE BURMESE VOICE + SRT
-# --------------------------------------------------
+# ---------------- VOICE + SRT ----------------
 
 async def create_voice(script, voice, audio_path, srt_path):
-    if not script or not script.strip():
-        raise RuntimeError("AI narration စာသား အလွတ်ဖြစ်နေပါတယ်။")
+    if not script.strip():
+        raise RuntimeError("Narration စာသားအလွတ်ဖြစ်နေပါတယ်။")
 
     last_error = None
 
@@ -303,55 +269,38 @@ async def create_voice(script, voice, audio_path, srt_path):
             if audio_path.exists():
                 audio_path.unlink()
 
-            communicate = edge_tts.Communicate(
-                script.strip(),
-                voice,
-            )
-
+            communicate = edge_tts.Communicate(script.strip(), voice)
             submaker = edge_tts.SubMaker()
             audio_size = 0
 
-            with open(audio_path, "wb") as audio_file:
+            with open(audio_path, "wb") as out:
                 async for chunk in communicate.stream():
                     if chunk["type"] == "audio":
-                        audio_file.write(chunk["data"])
+                        out.write(chunk["data"])
                         audio_size += len(chunk["data"])
                     elif chunk["type"] == "WordBoundary":
                         submaker.feed(chunk)
 
             if audio_size == 0:
-                raise RuntimeError("Edge TTS မှ အသံဒေတာ မရရှိပါ။")
+                raise RuntimeError("TTS အသံဒေတာ မရရှိပါ။")
 
-            srt_path.write_text(
-                submaker.get_srt(),
-                encoding="utf-8",
-            )
+            srt_path.write_text(submaker.get_srt(), encoding="utf-8")
             return
 
         except Exception as exc:
             last_error = exc
-
             if audio_path.exists():
                 audio_path.unlink()
 
-            logger.warning(
-                "TTS attempt %s failed: %s",
-                attempt + 1,
-                exc,
-            )
+            logger.warning("TTS attempt %s failed: %s", attempt + 1, exc)
 
             if attempt < 2:
                 await asyncio.sleep(2 * (attempt + 1))
 
-    raise RuntimeError(
-        f"Edge TTS မအောင်မြင်ပါ။ Voice={voice}; "
-        f"Error={type(last_error).__name__}: {last_error}"
-    ) from last_error
+    raise RuntimeError(f"Edge TTS မအောင်မြင်ပါ: {last_error}")
 
 
-# --------------------------------------------------
-# PROCESS VIDEO JOB
-# --------------------------------------------------
+# ---------------- VIDEO PROCESSING ----------------
 
 def process(job_id, video, opts):
     folder = WORK / job_id
@@ -364,19 +313,13 @@ def process(job_id, video, opts):
         script = write_script(transcript, opts)
 
         (folder / "transcript.txt").write_text(
-            transcript,
-            encoding="utf-8",
+            transcript, encoding="utf-8"
         )
         (folder / "script.txt").write_text(
-            script,
-            encoding="utf-8",
+            script, encoding="utf-8"
         )
 
-        update_job(
-            job_id,
-            status="generating_voice",
-            progress=65,
-        )
+        update_job(job_id, status="generating_voice", progress=65)
 
         voice = VOICES.get(opts["voice"], "my-MM-ThihaNeural")
         audio = folder / "voice.mp3"
@@ -388,45 +331,52 @@ def process(job_id, video, opts):
 
         video_duration = duration(video)
         audio_duration = duration(audio)
-
-        # Adjust playback speed so the video lasts for the narration.
-        vf = f"setpts={audio_duration / video_duration:.6f}*PTS"
+        speed = audio_duration / video_duration
 
         aspect_filters = {
             "9:16": (
-                "scale=1080:1920:force_original_aspect_ratio=decrease,"
-                "pad=1080:1920:(ow-iw)/2:(oh-ih)/2"
+                "scale=720:1280:force_original_aspect_ratio=decrease,"
+                "pad=720:1280:(ow-iw)/2:(oh-ih)/2"
             ),
             "16:9": (
-                "scale=1920:1080:force_original_aspect_ratio=decrease,"
-                "pad=1920:1080:(ow-iw)/2:(oh-ih)/2"
+                "scale=1280:720:force_original_aspect_ratio=decrease,"
+                "pad=1280:720:(ow-iw)/2:(oh-ih)/2"
             ),
             "1:1": (
-                "scale=1080:1080:force_original_aspect_ratio=decrease,"
-                "pad=1080:1080:(ow-iw)/2:(oh-ih)/2"
+                "scale=720:720:force_original_aspect_ratio=decrease,"
+                "pad=720:720:(ow-iw)/2:(oh-ih)/2"
             ),
         }
 
         aspect = opts["aspect"]
 
+        # Scale first to reduce processing cost; adjust playback speed.
+        vf = f"setpts={speed:.6f}*PTS"
         if aspect in aspect_filters:
             vf += "," + aspect_filters[aspect]
+        else:
+            vf += ",scale=720:1280:force_original_aspect_ratio=decrease"
+            vf += ",pad=720:1280:(ow-iw)/2:(oh-ih)/2"
 
         output = folder / "out.mp4"
 
         run([
             "ffmpeg", "-y",
+            "-threads", "1",
+            "-filter_threads", "1",
             "-i", str(video),
             "-i", str(audio),
-            "-vf", vf,
             "-map", "0:v:0",
             "-map", "1:a:0",
-            "-shortest",
+            "-vf", vf,
             "-c:v", "libx264",
+            "-threads", "1",
             "-preset", "ultrafast",
+            "-crf", "28",
             "-pix_fmt", "yuv420p",
             "-c:a", "aac",
-            "-b:a", "128k",
+            "-b:a", "96k",
+            "-shortest",
             "-movflags", "+faststart",
             str(output),
         ], timeout=900)
@@ -443,36 +393,32 @@ def process(job_id, video, opts):
             result_url=f"/api/jobs/{job_id}/result",
         )
 
-        logger.info("Job %s completed successfully", job_id)
+        logger.info("Job %s completed", job_id)
 
     except Exception as exc:
         logger.exception("Job %s failed", job_id)
-
         try:
             update_job(
                 job_id,
                 status="error",
                 progress=0,
-                error=f"{type(exc).__name__}: {str(exc)[:2500]}",
+                error=f"{type(exc).__name__}: {str(exc)[:1500]}",
             )
         except Exception:
-            logger.exception("Could not save failure status for %s", job_id)
+            logger.exception("Could not save job error")
 
 
-# --------------------------------------------------
-# API ROUTES
-# --------------------------------------------------
+# ---------------- API ROUTES ----------------
 
 @app.get("/")
 def home():
     index = Path("index.html")
-
     if index.is_file():
         return FileResponse(index)
 
     return {
         "name": "TZ Recap API",
-        "version": "2.1.0",
+        "version": "2.2.0",
         "status": "online",
         "docs": "/docs",
         "health": "/health",
@@ -500,43 +446,42 @@ async def create_job(
         raise HTTPException(400, "Please upload a video file.")
 
     try:
-        settings_data = json.loads(settings)
+        data = json.loads(settings)
     except (ValueError, TypeError):
         raise HTTPException(400, "Invalid settings JSON.")
 
-    if not isinstance(settings_data, dict):
+    if not isinstance(data, dict):
         raise HTTPException(400, "Settings must be a JSON object.")
 
     job_id = uuid.uuid4().hex[:12]
     folder = WORK / job_id
     folder.mkdir(parents=True, exist_ok=False)
-
     video_path = folder / "in.mp4"
-    size = 0
 
+    size = 0
     try:
         with open(video_path, "wb") as dest:
             while True:
-                chunk = await video.read(1024 * 1024)
-
+                chunk = await video.read(256 * 1024)
                 if not chunk:
                     break
 
                 size += len(chunk)
-
-                if size > 500 * 1024 * 1024:
+                if size > MAX_UPLOAD:
                     raise HTTPException(
                         413,
-                        "Video is larger than the 500 MB limit.",
+                        "Video exceeds 100 MB. Please upload a smaller video.",
                     )
-
                 dest.write(chunk)
 
     except Exception:
         if video_path.exists():
             video_path.unlink()
+        try:
+            folder.rmdir()
+        except OSError:
+            pass
         raise
-
     finally:
         await video.close()
 
@@ -544,11 +489,11 @@ async def create_job(
         raise HTTPException(400, "Uploaded video is empty.")
 
     opts = {
-        "mode": str(settings_data.get("mode", "Recap")),
-        "voice": str(settings_data.get("voice", "သီဟ")),
-        "style": str(settings_data.get("style", "Fast Recap")),
-        "aspect": str(settings_data.get("aspect", "Auto")),
-        "lang": str(settings_data.get("lang", "Burmese")),
+        "mode": str(data.get("mode", "Recap")),
+        "voice": str(data.get("voice", "သီဟ")),
+        "style": str(data.get("style", "Fast Recap")),
+        "aspect": str(data.get("aspect_ratio", data.get("aspect", "9:16"))),
+        "lang": str(data.get("language", data.get("lang", "Burmese"))),
     }
 
     update_job(
@@ -571,26 +516,19 @@ async def create_job(
 def job_status(job_id: str):
     with JOB_LOCK:
         job = JOBS.get(job_id)
-
         if not job:
             return JSONResponse(
                 status_code=404,
-                content={
-                    "status": "not_found",
-                    "error": "Job not found.",
-                },
+                content={"status": "not_found", "error": "Job not found."},
             )
-
         return dict(job)
 
 
 @app.get("/api/jobs/{job_id}/script")
 def job_script(job_id: str):
     path = WORK / job_id / "script.txt"
-
     if not path.is_file():
         raise HTTPException(404, "Script is not ready.")
-
     return FileResponse(
         path,
         media_type="text/plain; charset=utf-8",
@@ -601,10 +539,8 @@ def job_script(job_id: str):
 @app.get("/api/jobs/{job_id}/srt")
 def job_srt(job_id: str):
     path = WORK / job_id / "subs.srt"
-
     if not path.is_file():
         raise HTTPException(404, "SRT is not ready.")
-
     return FileResponse(
         path,
         media_type="application/x-subrip",
@@ -615,10 +551,8 @@ def job_srt(job_id: str):
 @app.get("/api/jobs/{job_id}/result")
 def job_result(job_id: str):
     path = WORK / job_id / "out.mp4"
-
     if not path.is_file():
         raise HTTPException(404, "MP4 is not ready.")
-
     return FileResponse(
         path,
         media_type="video/mp4",
