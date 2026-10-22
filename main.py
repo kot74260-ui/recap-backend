@@ -192,18 +192,19 @@ def write_script(transcript, opts):
 
     if opts["mode"].lower() == "translate":
         task = (
-            f"Translate this transcript into {lang}. "
-            "Preserve meaning, names, and event order. "
-            "For Burmese, use natural Burmese Unicode. "
-            "Return only the translation."
-        )
-    else:
-        task = (
-            f"Write a compelling movie recap in {lang}. "
-            f"{STYLES.get(opts['style'], STYLES['Fast Recap'])} "
-            "Preserve the original event order. "
-            "Use natural Burmese Unicode when appropriate. "
-            "Return narration only."
+            f"Translate the following transcript into {lang}. "
+            "You are an expert Myanmar movie recap scriptwriter and translator. "
+            "If the target language is Burmese, write in natural, fluent Burmese Unicode "
+            "that sounds like a real Myanmar narrator telling a movie story. "
+            "Do not translate word-for-word. Rewrite awkward expressions into natural Burmese "
+            "while preserving the original meaning, character names, events, and event order. "
+            "Use conversational movie-recap narration, consistent pronouns, correct grammar, "
+            "and proper Myanmar spelling. "
+            "Never produce unnatural phrases, broken sentences, duplicated words, or grammar errors. "
+            "Keep each sentence complete and easy to understand when spoken aloud. "
+            "Do not split one sentence awkwardly across unrelated lines. "
+            "Do not invent events or omit important details. "
+            "Return only the translated narration, without explanations or headings."
         )
 
     response = httpx.post(
