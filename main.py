@@ -258,6 +258,7 @@ def write_script(transcript, opts):
 
 # ---------------- VOICE + SRT ----------------
 
+
 async def create_voice(script, voice, audio_path, srt_path):
     if not script.strip():
         raise RuntimeError("Narration စာသားအလွတ်ဖြစ်နေပါတယ်။")
@@ -269,7 +270,9 @@ async def create_voice(script, voice, audio_path, srt_path):
             if audio_path.exists():
                 audio_path.unlink()
 
-            communicate = edge_tts.Communicate(script.strip(), voice)
+            communicate = edge_tts.Communicate(
+                script.strip(), voice
+            )
             submaker = edge_tts.SubMaker()
             audio_size = 0
 
@@ -284,15 +287,94 @@ async def create_voice(script, voice, audio_path, srt_path):
             if audio_size == 0:
                 raise RuntimeError("TTS အသံဒေတာ မရရှိပါ။")
 
-            srt_path.write_text(submaker.get_srt(), encoding="utf-8")
+            # Use Edge TTS subtitles when available.
+            srt_text = submaker.get_srt().strip()
+
+            # Fallback: generate subtitles if Edge TTS
+            # did not return any subtitle cues.
+            if not srt_text:
+                import re
+
+                parts = re.split(
+                    r"(?<=[။.!?])\s*",
+                    script.strip()
+                )
+                parts = [p.strip() for p in parts if p.strip()]
+
+                # Split long sentences into readable pieces.
+                segments = []
+                for part in parts:
+                    while len(part) > 100:
+                        cut = part.rfind(" ", 0, 100)
+                        if cut < 30:
+                            cut = 100
+                        segments.append(part[:cut].strip())
+                        part = part[cut:].strip()
+                    if part:
+                        segments.append(part)
+
+                if not segments:
+                    segments = [script.strip()]
+
+                audio_seconds = duration(audio_path)
+                weights = [max(1, len(x)) for x in segments]
+                total_weight = sum(weights)
+                elapsed = 0.0
+                entries = []
+
+                def stamp(seconds):
+                    ms = max(0, int(seconds * 1000))
+                    hours = ms // 3600000
+                    minutes = (ms % 3600000) // 60000
+                    secs = (ms % 60000) // 1000
+                    millis = ms % 1000
+                    return (
+                        f"{hours:02}:{minutes:02}:"
+                        f"{secs:02},{millis:03}"
+                    )
+
+                for index, (text, weight) in enumerate(
+                    zip(segments, weights), start=1
+                ):
+                    start = elapsed
+                    elapsed += audio_seconds * weight / total_weight
+                    end = min(audio_seconds, elapsed)
+
+                    entries.append(
+                        f"{index}\n"
+                        f"{stamp(start)} --> {stamp(end)}\n"
+                        f"{text}\n"
+                    )
+
+                srt_text = "\n".join(entries).strip()
+
+            if not srt_text:
+                raise RuntimeError("SRT စာတန်း မဖန်တီးနိုင်ပါ။")
+
+            srt_path.write_text(
+                srt_text + "\n",
+                encoding="utf-8"
+            )
+
+            if not srt_path.is_file() or srt_path.stat().st_size == 0:
+                raise RuntimeError("SRT ဖိုင်အလွတ်ဖြစ်နေပါတယ်။")
+
+            logger.info(
+                "SRT created: %s bytes",
+                srt_path.stat().st_size
+            )
             return
 
         except Exception as exc:
             last_error = exc
+
             if audio_path.exists():
                 audio_path.unlink()
 
-            logger.warning("TTS attempt %s failed: %s", attempt + 1, exc)
+            logger.warning(
+                "TTS attempt %s failed: %s",
+                attempt + 1, exc
+            )
 
             if attempt < 2:
                 await asyncio.sleep(2 * (attempt + 1))
