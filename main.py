@@ -175,47 +175,55 @@ def write_script(transcript, opts):
 
 
 
+
 async def create_voice(script, voice, audio_path, srt_path):
     if not script or not script.strip():
         raise RuntimeError("AI narration စာသား အလွတ်ဖြစ်နေပါတယ်။")
 
     audio_path.parent.mkdir(parents=True, exist_ok=True)
+    last_error = None
 
-    try:
-        communicate = edge_tts.Communicate(
-            script.strip(),
-            voice
-        )
-        submaker = edge_tts.SubMaker()
-        audio_size = 0
+    for attempt in range(3):
+        try:
+            if audio_path.exists():
+                audio_path.unlink()
 
-        with open(audio_path, "wb") as audio_file:
-            async for chunk in communicate.stream():
-                if chunk["type"] == "audio":
-                    audio_file.write(chunk["data"])
-                    audio_size += len(chunk["data"])
-                elif chunk["type"] == "WordBoundary":
-                    submaker.feed(chunk)
-
-        if audio_size == 0:
-            raise RuntimeError(
-                "Edge TTS မှ အသံဒေတာ မရရှိပါ။ "
-                f"အသုံးပြုထားသော voice: {voice}"
+            communicate = edge_tts.Communicate(
+                script.strip(),
+                voice
             )
+            submaker = edge_tts.SubMaker()
+            audio_size = 0
 
-        srt_path.write_text(
-            submaker.get_srt(),
-            encoding="utf-8"
-        )
+            with open(audio_path, "wb") as audio_file:
+                async for chunk in communicate.stream():
+                    if chunk["type"] == "audio":
+                        audio_file.write(chunk["data"])
+                        audio_size += len(chunk["data"])
+                    elif chunk["type"] == "WordBoundary":
+                        submaker.feed(chunk)
 
-    except Exception as exc:
-        if audio_path.exists():
-            audio_path.unlink()
+            if audio_size == 0:
+                raise RuntimeError("Edge TTS မှ အသံဒေတာ မရရှိပါ။")
 
-        raise RuntimeError(
-            f"Edge TTS အသံထုတ်လုပ်မှု မအောင်မြင်ပါ။ "
-            f"Voice={voice}; Error={type(exc).__name__}: {exc}"
-        ) from exc
+            srt_path.write_text(
+                submaker.get_srt(),
+                encoding="utf-8"
+            )
+            return
+
+        except Exception as exc:
+            last_error = exc
+            if audio_path.exists():
+                audio_path.unlink()
+
+            if attempt < 2:
+                await asyncio.sleep(2 * (attempt + 1))
+
+    raise RuntimeError(
+        f"Edge TTS မအောင်မြင်ပါ။ Voice={voice}; "
+        f"Error={type(last_error).__name__}: {last_error}"
+    ) from last_error
 
 
 
