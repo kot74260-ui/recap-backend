@@ -1,3 +1,4 @@
+
 import asyncio
 import json
 import logging
@@ -6,683 +7,841 @@ import subprocess
 import threading
 import uuid
 from pathlib import Path
+from typing import Any
 
 import edge_tts
 import httpx
-from fastapi import (
-    BackgroundTasks, FastAPI, File, Form,
-    HTTPException, UploadFile
-)
+from edge_tts import SubMaker
+from fastapi import BackgroundTasks, FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi.responses import FileResponse
 
-app = FastAPI(title="TZ Recap API", version="2.2.0")
+APP_VERSION = "3.0.0"
+GROQ_API_KEY = os.getenv("GROQ_API_KEY", "").strip()
+GROQ_BASE_URL = os.getenv(
+    "GROQ_BASE_URL", "https://api.groq.com/openai/v1"
+).rstrip("/")
+GROQ_CHAT_MODEL = os.getenv(
+    "GROQ_CHAT_MODEL", "llama-3.3-70b-versatile"
+)
+GROQ_WHISPER_MODEL = os.getenv(
+    "GROQ_WHISPER_MODEL", "whisper-large-v3"
+)
 
-logging.basicConfig(level=logging.INFO)
+WORK = Path(os.getenv("TZ_RECAP_WORK_DIR", "jobs"))
+WORK.mkdir(parents=True, exist_ok=True)
+STATE_FILE = WORK / "jobs_state.json"
+MAX_UPLOAD_BYTES = 100 * 1024 * 1024
+
+logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"))
 logger = logging.getLogger("tz-recap")
+
+app = FastAPI(
+    title="TZ Recap API",
+    version=APP_VERSION,
+    description=(
+        "Video transcription, Burmese translation, voice-over, "
+        "SRT subtitles and MP4 generation."
+    ),
+)
 
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
+    allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-WORK = Path("jobs")
-WORK.mkdir(parents=True, exist_ok=True)
-STATE_FILE = WORK / "job_state.json"
-
-JOBS = {}
-JOB_LOCK = threading.RLock()
-
-MAX_UPLOAD = 100 * 1024 * 1024
-
 VOICES = {
-    "Thiha · Male (Burmese)": "my-MM-ThihaNeural",
-    "Nilar · Female (Burmese)": "my-MM-NilarNeural",
+    "thiha": "my-MM-ThihaNeural",
     "သီဟ": "my-MM-ThihaNeural",
+    "thiha · male (burmese)": "my-MM-ThihaNeural",
+    "nilar": "my-MM-NilarNeural",
     "နီလာ": "my-MM-NilarNeural",
+    "nilar · female (burmese)": "my-MM-NilarNeural",
 }
 
-STYLES = {
-    "Fast Recap": "ဇာတ်လမ်းကို မြန်မြန်ဆန်ဆန်၊ စာကြောင်းတိုတိုဖြင့် ပြောပါ။",
-    "Story Mode": "ဇာတ်လမ်းပြောပြသလို သဘာဝကျပြီး ဆွဲဆောင်မှုရှိအောင် ရေးပါ။",
-    "Dramatic": "စိတ်လှုပ်ရှားဖွယ် ရုပ်ရှင် recap ပုံစံဖြင့် ရေးပါ။",
-    "Summary": "အဓိကအချက်များကို ရှင်းလင်းစွာ အကျဉ်းချုပ်ပါ။",
+DEFAULT_VOICE = "my-MM-ThihaNeural"
+
+STYLE_GUIDANCE = {
+    "fast recap": (
+        "Use energetic movie-recap narration and clear transitions. "
+        "Never invent plot events."
+    ),
+    "cinematic": (
+        "Use cinematic storytelling and suspenseful transitions "
+        "without inventing events."
+    ),
+    "natural": (
+        "Use simple, conversational Burmese that sounds natural when spoken."
+    ),
+    "horror": (
+        "Use suspenseful horror narration without adding events "
+        "absent from the source."
+    ),
+    "neutral": (
+        "Use clear, neutral Burmese suitable for subtitles and voice-over."
+    ),
 }
 
+JOB_LOCK = threading.Lock()
+JOBS: dict[str, dict[str, Any]] = {}
 ACTIVE_STATUSES = {
-    "queued", "transcribing", "writing_script",
-    "generating_voice", "rendering",
+    "queued", "transcribing", "translating", "voice", "rendering"
 }
 
 
-# ---------------- JOB STORAGE ----------------
-
-def save_jobs_unlocked():
-    temp = STATE_FILE.with_suffix(".tmp")
-    temp.write_text(
-        json.dumps(JOBS, ensure_ascii=False),
-        encoding="utf-8",
-    )
-    temp.replace(STATE_FILE)
-
-
-def update_job(job_id, **changes):
-    with JOB_LOCK:
-        JOBS.setdefault(job_id, {})
-        JOBS[job_id].update(changes)
-        save_jobs_unlocked()
+def save_state():
+    try:
+        with JOB_LOCK:
+            snapshot = json.dumps(
+                JOBS, ensure_ascii=False, indent=2
+            )
+        temporary = STATE_FILE.with_suffix(".tmp")
+        temporary.write_text(snapshot, encoding="utf-8")
+        temporary.replace(STATE_FILE)
+    except Exception:
+        logger.exception("Unable to save job state")
 
 
-def load_jobs():
+def load_state():
     if not STATE_FILE.exists():
         return
+
     try:
-        data = json.loads(STATE_FILE.read_text(encoding="utf-8"))
-        if isinstance(data, dict):
-            JOBS.update(data)
-    except (OSError, ValueError):
-        logger.exception("Could not load job state")
+        saved = json.loads(
+            STATE_FILE.read_text(encoding="utf-8")
+        )
+        if isinstance(saved, dict):
+            for job_id, job in saved.items():
+                if not isinstance(job, dict):
+                    continue
+
+                if job.get("status") in ACTIVE_STATUSES:
+                    job["status"] = "error"
+                    job["error"] = (
+                        "Server restarted during this job. "
+                        "Please submit the video again."
+                    )
+
+                JOBS[job_id] = job
+    except Exception:
+        logger.exception("Unable to load saved jobs")
 
 
-load_jobs()
+load_state()
 
-for job in JOBS.values():
-    if job.get("status") in ACTIVE_STATUSES:
-        job.update(
-            status="error",
-            progress=0,
-            error="Server restarted during processing. Please upload again.",
+
+def set_job(job_id: str, **updates):
+    with JOB_LOCK:
+        JOBS.setdefault(job_id, {}).update(updates)
+    save_state()
+
+
+def job_snapshot(job_id: str):
+    with JOB_LOCK:
+        job = JOBS.get(job_id)
+        return dict(job) if job else {}
+
+
+def run_command(command, timeout=900):
+    try:
+        return subprocess.run(
+            command,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            timeout=timeout,
+            check=False,
+        )
+    except FileNotFoundError as exc:
+        raise RuntimeError(
+            f"Required program not installed: {command[0]}. "
+            "Check that ffmpeg is installed."
+        ) from exc
+    except subprocess.TimeoutExpired as exc:
+        raise RuntimeError(
+            "Processing timed out. Try a shorter video."
+        ) from exc
+
+
+def require_api_key():
+    if not GROQ_API_KEY:
+        raise RuntimeError(
+            "GROQ_API_KEY is missing. Add it in Render Environment "
+            "and redeploy."
         )
 
-with JOB_LOCK:
-    try:
-        save_jobs_unlocked()
-    except OSError:
-        logger.exception("Could not save job state")
+
+def clean_text(text):
+    text = (text or "").replace("\ufeff", "").replace("\x00", "")
+    return "\n".join(
+        line.strip() for line in text.splitlines()
+    ).strip()
 
 
-# ---------------- COMMAND HELPERS ----------------
-
-def run(cmd, timeout=900):
-    logger.info("Running command: %s", cmd[0])
-
-    result = subprocess.run(
-        cmd,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True,
-        timeout=timeout,
+def normalize_mode(value):
+    mode = (
+        (value or "translate")
+        .strip()
+        .lower()
+        .replace("-", "_")
+        .replace(" ", "_")
     )
 
-    if result.returncode != 0:
-        details = result.stderr or result.stdout or "Command failed"
-        raise RuntimeError(details[-2000:])
+    if mode in {
+        "recap", "movie_recap", "movierecap", "summary"
+    }:
+        return "recap"
 
-    return result
+    if mode in {
+        "voiceover", "voice_over", "rewrite"
+    }:
+        return "voiceover"
 
-
-def duration(path):
-    result = run([
-        "ffprobe", "-v", "error",
-        "-show_entries", "format=duration",
-        "-of", "csv=p=0", str(path),
-    ], timeout=60)
-
-    try:
-        value = float(result.stdout.strip())
-    except (ValueError, TypeError):
-        raise RuntimeError("Could not read media duration")
-
-    if value <= 0:
-        raise RuntimeError("Invalid media duration")
-
-    return value
+    return "translate"
 
 
-# ---------------- GROQ TRANSCRIPTION ----------------
+def normalize_source_language(value):
+    value = (value or "zh").strip().lower()
 
-def transcribe(video, folder):
-    key = os.environ.get("GROQ_API_KEY")
-    if not key:
-        raise RuntimeError("Render Environment တွင် GROQ_API_KEY မရှိပါ။")
+    if value in {"", "auto", "automatic", "detect"}:
+        return None
 
-    audio = folder / "audio_small.mp3"
+    allowed = {
+        "zh", "en", "ja", "ko", "th", "vi", "id",
+        "ms", "hi", "fr", "de", "es", "pt", "ru",
+        "ar", "my",
+    }
 
-    run([
-        "ffmpeg", "-y",
-        "-threads", "1",
-        "-i", str(video),
+    return value if value in allowed else "zh"
+
+
+async def transcribe(video_path, folder, source_language="zh"):
+    require_api_key()
+
+    audio_path = folder / "source_audio.mp3"
+
+    result = run_command([
+        "ffmpeg", "-y", "-i", str(video_path),
         "-vn", "-ac", "1", "-ar", "16000",
-        "-b:a", "32k",
-        str(audio),
-    ], timeout=900)
+        "-b:a", "64k", str(audio_path),
+    ])
 
-    with open(audio, "rb") as f:
-        response = httpx.post(
-            "https://api.groq.com/openai/v1/audio/transcriptions",
-            headers={"Authorization": f"Bearer {key}"},
-            data={"model": "whisper-large-v3",
-                  "language": "zh",
-                  "response_format": "json",
-                  "temperature": "0",
-            },
-
-            files={"file": ("audio.mp3", f, "audio/mpeg")},
-            timeout=300,
-        )
-
-    if response.is_error:
+    if result.returncode != 0 or not audio_path.exists():
         raise RuntimeError(
-            f"Groq transcription error {response.status_code}: "
-            f"{response.text[:1000]}"
+            f"Could not extract audio: {(result.stderr or '')[-1600:]}"
         )
 
-    transcript = response.json().get("text", "").strip()
+    form_data = {
+        "model": GROQ_WHISPER_MODEL,
+        "response_format": "json",
+    }
+
+    language_code = normalize_source_language(source_language)
+    if language_code:
+        form_data["language"] = language_code
+
+    async with httpx.AsyncClient(timeout=300) as client:
+        with audio_path.open("rb") as audio:
+            response = await client.post(
+                f"{GROQ_BASE_URL}/audio/transcriptions",
+                headers={
+                    "Authorization": f"Bearer {GROQ_API_KEY}"
+                },
+                data=form_data,
+                files={
+                    "file": (
+                        audio_path.name,
+                        audio,
+                        "audio/mpeg",
+                    )
+                },
+            )
+
+    if response.status_code >= 400:
+        raise RuntimeError(
+            f"Speech recognition failed "
+            f"({response.status_code}): {response.text[:1200]}"
+        )
+
+    transcript = clean_text(response.json().get("text", ""))
+
     if not transcript:
-        raise RuntimeError("ဗီဒီယိုထဲမှ အသံစာသား မရရှိပါ။")
+        raise RuntimeError("No speech was detected in the video.")
 
     return transcript
 
 
-# ---------------- TRANSLATION / RECAP ----------------
+async def write_script(transcript, options):
+    require_api_key()
 
+    mode = normalize_mode(
+        str(options.get("mode", "translate"))
+    )
+    target_language = str(
+        options.get("lang", "Burmese")
+    ).strip() or "Burmese"
 
-def write_script(transcript, opts):
-    key = os.environ.get("GROQ_API_KEY")
-    if not key:
-        raise RuntimeError("GROQ_API_KEY မသတ်မှတ်ထားပါ။")
+    style = str(
+        options.get("style", "Fast Recap")
+    ).strip().lower()
 
-    if not transcript or not transcript.strip():
-        raise RuntimeError("မူရင်းစာသား မရရှိပါ။")
-
-    lang = opts.get("lang", "Burmese")
-    mode = opts.get("mode", "translate").lower()
-    style = opts.get("style", "Fast Recap")
-
-    # အဓိကရည်ရွယ်ချက်မှာ မြန်မာစာသားကို သဘာဝကျအောင် ပြန်ရေးရန်ဖြစ်သည်။
-    task = """
-You are an expert Chinese-to-Myanmar Burmese translator
-and professional Myanmar movie recap writer.
-
-SOURCE LANGUAGE:
-The transcript is primarily Simplified or Traditional Chinese.
-
-OUTPUT LANGUAGE:
-Natural, fluent Myanmar Burmese Unicode only.
-
-TRANSLATION RULES:
-1. First understand the complete meaning of the Chinese transcript.
-2. Translate the meaning accurately into natural Myanmar Burmese.
-3. Never translate Chinese word-for-word.
-4. Preserve character names, titles, relationships, events,
-   facts, intentions, and the original event order.
-5. Translate Chinese royal titles and forms of address
-   according to context. Do not mechanically repeat titles.
-6. Do not invent dialogue, actions, emotions, or story events.
-7. Do not add details that are absent from the transcript.
-8. Repair awkward Burmese phrasing while preserving meaning.
-9. Use correct Myanmar grammar and natural spoken narration.
-10. Avoid repetitive phrases and literal machine-translation
-    expressions such as unnatural translations of idioms.
-11. If a phrase is genuinely unclear, use a conservative
-    translation rather than guessing.
-12. Return only the final Myanmar Burmese text.
-13. Do not include English, Chinese, explanations, headings,
-    or translator notes in the output.
-
-The result must sound natural when narrated aloud in Myanmar.
-"""
-    if mode != "translate":
-        task += (
-            "\nWrite in engaging movie recap narration style. "
-            "Keep the important story details and their original order.\n"
-        )
-
-    task += f"\nNarration style: {style}\n"
-
-    response = httpx.post(
-        "https://api.groq.com/openai/v1/chat/completions",
-        headers={
-            "Authorization": f"Bearer {key}",
-            "Content-Type": "application/json",
-        },
-        json={
-            "model": "openai/gpt-oss-120b",
-            "messages": [
-                {
-                    "role": "system",
-                    "content": task,
-                },
-                {
-                    "role": "user",
-                    "content": (
-                        "အောက်ပါမူရင်းအသံမှ ရရှိထားသော စာသားကို "
-                        "အဓိပ္ပာယ်မပျက်စေဘဲ သဘာဝကျသော မြန်မာဘာသာဖြင့် "
-                        "ပြန်ရေးပေးပါ။ မြန်မာစာသားကိုသာ ပြန်ပေးပါ။\n\n"
-                        + transcript[:20000]
-                    ),
-                },
-            ],
-            "temperature": 0.2,
-            "max_tokens": 6000,
-        },
-        timeout=180,
+    style_hint = STYLE_GUIDANCE.get(
+        style, STYLE_GUIDANCE["fast recap"]
     )
 
-    if response.is_error:
-        raise RuntimeError(
-            f"Groq writing error {response.status_code}: "
-            f"{response.text[:1000]}"
+    if target_language.lower() in {
+        "burmese", "myanmar", "my", "မြန်မာ"
+    }:
+        language_rule = (
+            "Output natural, fluent Myanmar Burmese in Unicode only. "
+            "Do not use romanized Burmese."
+        )
+    else:
+        language_rule = f"Output in {target_language}."
+
+    if mode == "translate":
+        task = (
+            "Translate the complete source transcript into natural, "
+            "easy-to-understand Burmese. Preserve the original meaning, "
+            "important details, speaker identity and event order. "
+            "Repair fragmented speech into sensible sentences. "
+            "Use appropriate Myanmar honorifics for royal or historical "
+            "dialogue. Do not summarize, invent details, explain, or add "
+            "a heading. Return only the translation."
+        )
+    elif mode == "voiceover":
+        task = (
+            "Rewrite the transcript as smooth spoken narration while "
+            "preserving its meaning and events. Do not add facts, scenes, "
+            "motives, or dialogue not supported by the source. "
+            "Return only the finished voice-over script."
+        )
+    else:
+        task = (
+            "Write an engaging movie recap based only on the source "
+            "transcript. Keep important plot events in order and use "
+            "clear transitions. Do not invent missing scenes or facts. "
+            "Return only the narration."
         )
 
-    data = response.json()
-    choices = data.get("choices", [])
-    script = (
-        choices[0].get("message", {}).get("content", "").strip()
-        if choices else ""
+    prompt = f"""
+You are an experienced Chinese-to-Myanmar translator
+and movie voice-over writer.
+
+{language_rule}
+
+Rules:
+- Understand the source meaning; do not translate mechanically word by word.
+- Preserve who is speaking and who is being addressed.
+- For Chinese royal or historical dialogue, use natural Burmese forms
+  such as "အရှင်မင်းကြီး" only when the context supports them.
+- Use fluent Burmese grammar and natural punctuation.
+- Do not output English explanations or a "Translation:" heading.
+- Do not repeat the source transcript.
+- Never invent details to fill gaps.
+- Style guidance: {style_hint}
+
+Task:
+{task}
+
+Source transcript:
+{transcript[:24000]}
+""".strip()
+
+    payload = {
+        "model": GROQ_CHAT_MODEL,
+        "messages": [
+            {
+                "role": "system",
+                "content": (
+                    "You are a precise translator. Meaning and natural "
+                    "target-language expression come first. Never invent "
+                    "details. Return only the requested output."
+                ),
+            },
+            {"role": "user", "content": prompt},
+        ],
+        "temperature": 0.15,
+        "max_tokens": 6000,
+    }
+
+    async with httpx.AsyncClient(timeout=180) as client:
+        response = await client.post(
+            f"{GROQ_BASE_URL}/chat/completions",
+            headers={
+                "Authorization": f"Bearer {GROQ_API_KEY}",
+                "Content-Type": "application/json",
+            },
+            json=payload,
+        )
+
+    if response.status_code >= 400:
+        raise RuntimeError(
+            f"Translation failed ({response.status_code}): "
+            f"{response.text[:1200]}"
+        )
+
+    choices = response.json().get("choices", [])
+    if not choices:
+        raise RuntimeError("AI returned an empty script.")
+
+    script = clean_text(
+        choices[0].get("message", {}).get("content", "")
     )
 
     if not script:
-        raise RuntimeError("AI မှ မြန်မာစာသား မရရှိပါ။")
+        raise RuntimeError("AI returned an empty script.")
 
     return script
 
 
-# ---------------- VOICE + SRT ----------------
+def make_fallback_srt(script):
+    chunks = [
+        line.strip() for line in script.splitlines()
+        if line.strip()
+    ]
+
+    if not chunks and script.strip():
+        chunks = [script.strip()]
+
+    def stamp(ms):
+        hours, remainder = divmod(ms, 3600000)
+        minutes, remainder = divmod(remainder, 60000)
+        seconds, millis = divmod(remainder, 1000)
+        return (
+            f"{hours:02}:{minutes:02}:"
+            f"{seconds:02},{millis:03}"
+        )
+
+    result = []
+    cursor = 0
+
+    for index, chunk in enumerate(chunks, 1):
+        duration = max(2200, min(7000, len(chunk) * 85))
+        result.extend([
+            str(index),
+            f"{stamp(cursor)} --> {stamp(cursor + duration)}",
+            chunk,
+            "",
+        ])
+        cursor += duration
+
+    return "\n".join(result)
 
 
-async def create_voice(script, voice, audio_path, srt_path):
-    if not script.strip():
-        raise RuntimeError("Narration စာသားအလွတ်ဖြစ်နေပါတယ်။")
+async def create_voice(script, folder, voice_name):
+    key = voice_name.strip().lower()
+    voice = VOICES.get(
+        key, VOICES.get(voice_name.strip(), DEFAULT_VOICE)
+    )
 
-    last_error = None
+    audio_path = folder / "voice.mp3"
+    srt_path = folder / "subtitles.srt"
 
-    for attempt in range(3):
-        try:
-            if audio_path.exists():
-                audio_path.unlink()
+    maker = SubMaker()
+    tts = edge_tts.Communicate(script, voice)
 
-            communicate = edge_tts.Communicate(
-                script.strip(), voice
-            )
-            submaker = edge_tts.SubMaker()
-            audio_size = 0
-
-            with open(audio_path, "wb") as out:
-                async for chunk in communicate.stream():
-                    if chunk["type"] == "audio":
-                        out.write(chunk["data"])
-                        audio_size += len(chunk["data"])
-                    elif chunk["type"] == "WordBoundary":
-                        submaker.feed(chunk)
-
-            if audio_size == 0:
-                raise RuntimeError("TTS အသံဒေတာ မရရှိပါ။")
-
-            # Use Edge TTS subtitles when available.
-            srt_text = submaker.get_srt().strip()
-
-            # Fallback: generate subtitles if Edge TTS
-            # did not return any subtitle cues.
-            if not srt_text:
-                import re
-
-                parts = re.split(
-                    r"(?<=[။.!?])\s*",
-                    script.strip()
-                )
-                parts = [p.strip() for p in parts if p.strip()]
-
-                # Split long sentences into readable pieces.
-                segments = []
-                for part in parts:
-                    while len(part) > 100:
-                        cut = part.rfind(" ", 0, 100)
-                        if cut < 30:
-                            cut = 100
-                        segments.append(part[:cut].strip())
-                        part = part[cut:].strip()
-                    if part:
-                        segments.append(part)
-
-                if not segments:
-                    segments = [script.strip()]
-
-                audio_seconds = duration(audio_path)
-                weights = [max(1, len(x)) for x in segments]
-                total_weight = sum(weights)
-                elapsed = 0.0
-                entries = []
-
-                def stamp(seconds):
-                    ms = max(0, int(seconds * 1000))
-                    hours = ms // 3600000
-                    minutes = (ms % 3600000) // 60000
-                    secs = (ms % 60000) // 1000
-                    millis = ms % 1000
-                    return (
-                        f"{hours:02}:{minutes:02}:"
-                        f"{secs:02},{millis:03}"
+    with audio_path.open("wb") as output:
+        async for chunk in tts.stream():
+            if chunk["type"] == "audio":
+                output.write(chunk["data"])
+            elif chunk["type"] == "WordBoundary":
+                try:
+                    maker.create_sub(
+                        (chunk["offset"], chunk["duration"]),
+                        chunk["text"],
                     )
+                except Exception:
+                    pass
 
-                for index, (text, weight) in enumerate(
-                    zip(segments, weights), start=1
-                ):
-                    start = elapsed
-                    elapsed += audio_seconds * weight / total_weight
-                    end = min(audio_seconds, elapsed)
-
-                    entries.append(
-                        f"{index}\n"
-                        f"{stamp(start)} --> {stamp(end)}\n"
-                        f"{text}\n"
-                    )
-
-                srt_text = "\n".join(entries).strip()
-
-            if not srt_text:
-                raise RuntimeError("SRT စာတန်း မဖန်တီးနိုင်ပါ။")
-
-            srt_path.write_text(
-                srt_text + "\n",
-                encoding="utf-8"
-            )
-
-            if not srt_path.is_file() or srt_path.stat().st_size == 0:
-                raise RuntimeError("SRT ဖိုင်အလွတ်ဖြစ်နေပါတယ်။")
-
-            logger.info(
-                "SRT created: %s bytes",
-                srt_path.stat().st_size
-            )
-            return
-
-        except Exception as exc:
-            last_error = exc
-
-            if audio_path.exists():
-                audio_path.unlink()
-
-            logger.warning(
-                "TTS attempt %s failed: %s",
-                attempt + 1, exc
-            )
-
-            if attempt < 2:
-                await asyncio.sleep(2 * (attempt + 1))
-
-    raise RuntimeError(f"Edge TTS မအောင်မြင်ပါ: {last_error}")
-
-
-# ---------------- VIDEO PROCESSING ----------------
-
-def process(job_id, video, opts):
-    folder = WORK / job_id
+    if not audio_path.exists() or audio_path.stat().st_size == 0:
+        raise RuntimeError("TTS did not return any audio.")
 
     try:
-        update_job(job_id, status="transcribing", progress=15)
-        transcript = transcribe(video, folder)
+        subtitles = maker.generate_subs()
+    except Exception:
+        subtitles = ""
 
-        update_job(job_id, status="writing_script", progress=40)
-        script = write_script(transcript, opts)
+    if not subtitles.strip():
+        subtitles = make_fallback_srt(script)
+
+    srt_path.write_text(subtitles, encoding="utf-8")
+    return audio_path, srt_path
+
+
+def probe_duration(path):
+    result = run_command([
+        "ffprobe", "-v", "error",
+        "-show_entries", "format=duration",
+        "-of", "default=noprint_wrappers=1:nokey=1",
+        str(path),
+    ], timeout=60)
+
+    try:
+        return float(result.stdout.strip()) if result.returncode == 0 else 0.0
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def render_video(video, audio, output, aspect):
+    filters = {
+        "9:16": (
+            "scale=720:1280:force_original_aspect_ratio=increase,"
+            "crop=720:1280"
+        ),
+        "16:9": (
+            "scale=1280:720:force_original_aspect_ratio=increase,"
+            "crop=1280:720"
+        ),
+        "1:1": (
+            "scale=1080:1080:force_original_aspect_ratio=increase,"
+            "crop=1080:1080"
+        ),
+    }
+
+    vf = filters.get(aspect, filters["9:16"])
+    source_duration = probe_duration(video)
+    audio_duration = probe_duration(audio)
+
+    speed = 1.0
+    if source_duration > 0 and audio_duration > 0:
+        speed = max(
+            0.5, min(2.0, source_duration / audio_duration)
+        )
+
+    setpts = f"setpts={1.0 / speed:.6f}*PTS"
+
+    result = run_command([
+        "ffmpeg", "-y",
+        "-i", str(video),
+        "-i", str(audio),
+        "-vf", f"{vf},{setpts}",
+        "-map", "0:v:0",
+        "-map", "1:a:0",
+        "-c:v", "libx264",
+        "-preset", "veryfast",
+        "-crf", "23",
+        "-c:a", "aac",
+        "-b:a", "160k",
+        "-pix_fmt", "yuv420p",
+        "-shortest",
+        "-movflags", "+faststart",
+        str(output),
+    ], timeout=1800)
+
+    if (
+        result.returncode != 0
+        or not output.exists()
+        or output.stat().st_size == 0
+    ):
+        raise RuntimeError(
+            f"Video rendering failed: {(result.stderr or '')[-2200:]}"
+        )
+
+
+async def process_job(job_id):
+    job = job_snapshot(job_id)
+    if not job:
+        return
+
+    folder = Path(job["folder"])
+    video = folder / "in.mp4"
+    options = job.get("options", {})
+
+    try:
+        set_job(
+            job_id,
+            status="transcribing",
+            progress=10,
+            message="ဗီဒီယိုအသံကို စာသားပြောင်းနေသည်",
+        )
+
+        transcript = await transcribe(
+            video,
+            folder,
+            str(options.get("source_language", "zh")),
+        )
 
         (folder / "transcript.txt").write_text(
             transcript, encoding="utf-8"
         )
+
+        set_job(
+            job_id,
+            transcript=transcript,
+            status="translating",
+            progress=35,
+            message="မြန်မာဘာသာပြန်နေသည်",
+        )
+
+        script = await write_script(transcript, options)
+
         (folder / "script.txt").write_text(
             script, encoding="utf-8"
         )
 
-        update_job(job_id, status="generating_voice", progress=65)
+        set_job(
+            job_id,
+            script=script,
+            status="voice",
+            progress=55,
+            message="မြန်မာ AI အသံနှင့် SRT ဖန်တီးနေသည်",
+        )
 
-        voice = VOICES.get(opts["voice"], "my-MM-ThihaNeural")
-        audio = folder / "voice.mp3"
-        srt = folder / "subs.srt"
+        audio, srt = await create_voice(
+            script, folder, str(options.get("voice", "သီဟ"))
+        )
 
-        asyncio.run(create_voice(script, voice, audio, srt))
+        set_job(
+            job_id,
+            status="rendering",
+            progress=75,
+            message="MP4 ဗီဒီယို တည်ဆောက်နေသည်",
+        )
 
-        update_job(job_id, status="rendering", progress=85)
+        output = folder / "result.mp4"
 
-        video_duration = duration(video)
-        audio_duration = duration(audio)
-        speed = audio_duration / video_duration
+        render_video(
+            video, audio, output,
+            str(options.get("aspect", "9:16")),
+        )
 
-        aspect_filters = {
-            "9:16": (
-                "scale=720:1280:force_original_aspect_ratio=decrease,"
-                "pad=720:1280:(ow-iw)/2:(oh-ih)/2"
-            ),
-            "16:9": (
-                "scale=1280:720:force_original_aspect_ratio=decrease,"
-                "pad=1280:720:(ow-iw)/2:(oh-ih)/2"
-            ),
-            "1:1": (
-                "scale=720:720:force_original_aspect_ratio=decrease,"
-                "pad=720:720:(ow-iw)/2:(oh-ih)/2"
-            ),
-        }
-
-        aspect = opts["aspect"]
-
-        # Scale first to reduce processing cost; adjust playback speed.
-        vf = f"setpts={speed:.6f}*PTS"
-        if aspect in aspect_filters:
-            vf += "," + aspect_filters[aspect]
-        else:
-            vf += ",scale=720:1280:force_original_aspect_ratio=decrease"
-            vf += ",pad=720:1280:(ow-iw)/2:(oh-ih)/2"
-
-        output = folder / "out.mp4"
-
-        run([
-            "ffmpeg", "-y",
-            "-threads", "1",
-            "-filter_threads", "1",
-            "-i", str(video),
-            "-i", str(audio),
-            "-map", "0:v:0",
-            "-map", "1:a:0",
-            "-vf", vf,
-            "-c:v", "libx264",
-            "-threads", "1",
-            "-preset", "ultrafast",
-            "-crf", "28",
-            "-pix_fmt", "yuv420p",
-            "-c:a", "aac",
-            "-b:a", "96k",
-            "-shortest",
-            "-movflags", "+faststart",
-            str(output),
-        ], timeout=900)
-
-        if not output.is_file() or output.stat().st_size == 0:
-            raise RuntimeError("MP4 ဖိုင် မထုတ်နိုင်ပါ။")
-
-        update_job(
+        set_job(
             job_id,
             status="done",
             progress=100,
+            message="ပြီးပါပြီ",
+            result_url=f"/api/jobs/{job_id}/result",
             script_url=f"/api/jobs/{job_id}/script",
             srt_url=f"/api/jobs/{job_id}/srt",
-            result_url=f"/api/jobs/{job_id}/result",
+            transcript_url=f"/api/jobs/{job_id}/transcript",
+            audio_url=f"/api/jobs/{job_id}/audio",
+            created_video_size=output.stat().st_size,
         )
-
-        logger.info("Job %s completed", job_id)
 
     except Exception as exc:
         logger.exception("Job %s failed", job_id)
-        try:
-            update_job(
-                job_id,
-                status="error",
-                progress=0,
-                error=f"{type(exc).__name__}: {str(exc)[:1500]}",
-            )
-        except Exception:
-            logger.exception("Could not save job error")
+        set_job(
+            job_id,
+            status="error",
+            progress=100,
+            message="လုပ်ဆောင်မှု မအောင်မြင်ပါ",
+            error=str(exc),
+        )
 
-
-# ---------------- API ROUTES ----------------
 
 @app.get("/")
-def home():
-    index = Path("index.html")
-    if index.is_file():
-        return FileResponse(index)
-
+async def root():
     return {
         "name": "TZ Recap API",
-        "version": "2.2.0",
-        "status": "online",
+        "version": APP_VERSION,
+        "status": "ok",
         "docs": "/docs",
         "health": "/health",
     }
 
 
 @app.get("/health")
-def health():
+async def health():
+    ffmpeg_ok = subprocess.call([
+        "sh", "-c", "command -v ffmpeg >/dev/null 2>&1"
+    ]) == 0
+
     return {
         "status": "ok",
-        "groq_key_configured": bool(os.environ.get("GROQ_API_KEY")),
+        "version": APP_VERSION,
+        "groq_configured": bool(GROQ_API_KEY),
+        "ffmpeg_available": ffmpeg_ok,
     }
 
 
 @app.post("/api/jobs")
 async def create_job(
-    bg: BackgroundTasks,
+    background_tasks: BackgroundTasks,
     video: UploadFile = File(...),
     settings: str = Form("{}"),
 ):
-    if not video.filename:
-        raise HTTPException(400, "Video file is required.")
+    allowed_extensions = {
+        ".mp4", ".mov", ".mkv", ".webm", ".m4v", ".avi"
+    }
 
-    if video.content_type and not video.content_type.startswith("video/"):
-        raise HTTPException(400, "Please upload a video file.")
+    filename = (video.filename or "upload.mp4").lower()
+
+    if Path(filename).suffix not in allowed_extensions:
+        raise HTTPException(
+            status_code=400,
+            detail="Supported formats: MP4, MOV, MKV, WEBM, M4V, AVI.",
+        )
 
     try:
-        data = json.loads(settings)
-    except (ValueError, TypeError):
-        raise HTTPException(400, "Invalid settings JSON.")
-
-    if not isinstance(data, dict):
-        raise HTTPException(400, "Settings must be a JSON object.")
+        data = json.loads(settings or "{}")
+        if not isinstance(data, dict):
+            raise ValueError()
+    except Exception:
+        raise HTTPException(
+            status_code=400,
+            detail="settings must be a valid JSON object.",
+        )
 
     job_id = uuid.uuid4().hex[:12]
     folder = WORK / job_id
-    folder.mkdir(parents=True, exist_ok=False)
+    folder.mkdir(parents=True, exist_ok=True)
     video_path = folder / "in.mp4"
+    total = 0
 
-    size = 0
     try:
-        with open(video_path, "wb") as dest:
+        with video_path.open("wb") as target:
             while True:
-                chunk = await video.read(256 * 1024)
+                chunk = await video.read(1024 * 1024)
                 if not chunk:
                     break
 
-                size += len(chunk)
-                if size > MAX_UPLOAD:
-                    raise HTTPException(
-                        413,
-                        "Video exceeds 100 MB. Please upload a smaller video.",
-                    )
-                dest.write(chunk)
+                total += len(chunk)
 
-    except Exception:
-        if video_path.exists():
-            video_path.unlink()
-        try:
-            folder.rmdir()
-        except OSError:
-            pass
-        raise
+                if total > MAX_UPLOAD_BYTES:
+                    raise HTTPException(
+                        status_code=413,
+                        detail="Maximum upload size is 100 MB.",
+                    )
+
+                target.write(chunk)
     finally:
         await video.close()
 
-    if size == 0:
-        raise HTTPException(400, "Uploaded video is empty.")
+    if total == 0:
+        raise HTTPException(
+            status_code=400,
+            detail="Uploaded video is empty.",
+        )
 
-    opts = {
-        "mode": str(data.get("mode", "Recap")),
+    # Default mode is translation, not recap.
+    options = {
+        "mode": normalize_mode(
+            str(data.get("mode", "translate"))
+        ),
         "voice": str(data.get("voice", "သီဟ")),
         "style": str(data.get("style", "Fast Recap")),
-        "aspect": str(data.get("aspect_ratio", data.get("aspect", "9:16"))),
-        "lang": str(data.get("language", data.get("lang", "Burmese"))),
+        "aspect": str(
+            data.get("aspect_ratio", data.get("aspect", "9:16"))
+        ),
+        "lang": str(
+            data.get("language", data.get("lang", "Burmese"))
+        ),
+        "source_language": str(
+            data.get("source_language", "zh")
+        ),
     }
 
-    update_job(
-        job_id,
-        status="queued",
-        progress=5,
-        created_video_size=size,
-    )
+    with JOB_LOCK:
+        JOBS[job_id] = {
+            "job_id": job_id,
+            "status": "queued",
+            "progress": 0,
+            "message": "တန်းစီထားသည်",
+            "folder": str(folder),
+            "filename": filename,
+            "options": options,
+        }
 
-    bg.add_task(process, job_id, video_path, opts)
+    save_state()
+    background_tasks.add_task(process_job, job_id)
 
     return {
         "job_id": job_id,
         "status": "queued",
         "status_url": f"/api/jobs/{job_id}",
+        "script_url": f"/api/jobs/{job_id}/script",
+        "srt_url": f"/api/jobs/{job_id}/srt",
+        "result_url": f"/api/jobs/{job_id}/result",
+        "transcript_url": f"/api/jobs/{job_id}/transcript",
+        "mode": options["mode"],
     }
 
 
 @app.get("/api/jobs/{job_id}")
-def job_status(job_id: str):
-    with JOB_LOCK:
-        job = JOBS.get(job_id)
-        if not job:
-            return JSONResponse(
-                status_code=404,
-                content={"status": "not_found", "error": "Job not found."},
-            )
-        return dict(job)
+async def get_job(job_id: str):
+    job = job_snapshot(job_id)
+
+    if not job:
+        raise HTTPException(
+            status_code=404, detail="Job not found."
+        )
+
+    return {
+        key: value
+        for key, value in job.items()
+        if key not in {
+            "folder", "options", "transcript", "script"
+        }
+    }
+
+
+def artifact(job_id, filename, media_type, download_name):
+    job = job_snapshot(job_id)
+
+    if not job:
+        raise HTTPException(
+            status_code=404, detail="Job not found."
+        )
+
+    path = Path(job["folder"]) / filename
+
+    if not path.exists():
+        raise HTTPException(
+            status_code=404,
+            detail=f"{filename} is not ready yet.",
+        )
+
+    return FileResponse(
+        path,
+        media_type=media_type,
+        filename=download_name,
+    )
 
 
 @app.get("/api/jobs/{job_id}/script")
-def job_script(job_id: str):
-    path = WORK / job_id / "script.txt"
-    if not path.is_file():
-        raise HTTPException(404, "Script is not ready.")
-    return FileResponse(
-        path,
-        media_type="text/plain; charset=utf-8",
-        filename="recap_script.txt",
+async def get_script(job_id: str):
+    return artifact(
+        job_id, "script.txt",
+        "text/plain; charset=utf-8",
+        "myanmar_script.txt",
+    )
+
+
+@app.get("/api/jobs/{job_id}/transcript")
+async def get_transcript(job_id: str):
+    return artifact(
+        job_id, "transcript.txt",
+        "text/plain; charset=utf-8",
+        "source_transcript.txt",
     )
 
 
 @app.get("/api/jobs/{job_id}/srt")
-def job_srt(job_id: str):
-    path = WORK / job_id / "subs.srt"
-    if not path.is_file():
-        raise HTTPException(404, "SRT is not ready.")
-    return FileResponse(
-        path,
-        media_type="application/x-subrip",
-        filename="myanmar_recap.srt",
+async def get_srt(job_id: str):
+    return artifact(
+        job_id, "subtitles.srt",
+        "application/x-subrip; charset=utf-8",
+        "myanmar_subtitles.srt",
     )
 
 
 @app.get("/api/jobs/{job_id}/result")
-def job_result(job_id: str):
-    path = WORK / job_id / "out.mp4"
-    if not path.is_file():
-        raise HTTPException(404, "MP4 is not ready.")
-    return FileResponse(
-        path,
-        media_type="video/mp4",
-        filename="recap.mp4",
+async def get_result(job_id: str):
+    return artifact(
+        job_id, "result.mp4",
+        "video/mp4",
+        "tz_recap_result.mp4",
     )
 
-@app.get("/api/jobs/{job_id}/transcript")
-def job_transcript(job_id: str):
-    path = WORK / job_id / "transcript.txt"
-    if not path.is_file():
-        raise HTTPException(404, "Original transcript is not ready.")
-    return FileResponse(
-        path,
-        media_type="text/plain; charset=utf-8",
-        filename="original_transcript.txt",
+
+@app.get("/api/jobs/{job_id}/audio")
+async def get_audio(job_id: str):
+    return artifact(
+        job_id, "voice.mp3",
+        "audio/mpeg",
+        "myanmar_voice.mp3",
     )
-    
