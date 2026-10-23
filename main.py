@@ -22,7 +22,7 @@ GROQ_BASE_URL = os.getenv(
     "GROQ_BASE_URL", "https://api.groq.com/openai/v1"
 ).rstrip("/")
 GROQ_CHAT_MODEL = os.getenv(
-    "GROQ_CHAT_MODEL", "llama-3.3-70b-versatile"
+    "GROQ_CHAT_MODEL", "openai/gpt-oss-120b"
 )
 GROQ_WHISPER_MODEL = os.getenv(
     "GROQ_WHISPER_MODEL", "whisper-large-v3"
