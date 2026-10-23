@@ -163,7 +163,12 @@ def transcribe(video, folder):
         response = httpx.post(
             "https://api.groq.com/openai/v1/audio/transcriptions",
             headers={"Authorization": f"Bearer {key}"},
-            data={"model": "whisper-large-v3"},
+            data={"model": "whisper-large-v3",
+                  "language": "zh",
+                  "response_format": "json",
+                  "temperature": "0",
+            },
+
             files={"file": ("audio.mp3", f, "audio/mpeg")},
             timeout=300,
         )
@@ -198,30 +203,37 @@ def write_script(transcript, opts):
 
     # အဓိကရည်ရွယ်ချက်မှာ မြန်မာစာသားကို သဘာဝကျအောင် ပြန်ရေးရန်ဖြစ်သည်။
     task = """
-You are a professional multilingual translator and Myanmar movie recap writer.
+You are an expert Chinese-to-Myanmar Burmese translator
+and professional Myanmar movie recap writer.
 
-MAIN REQUIREMENT:
-Convert the provided transcript into natural, fluent Myanmar Burmese Unicode.
-This requirement applies regardless of the source language.
+SOURCE LANGUAGE:
+The transcript is primarily Simplified or Traditional Chinese.
 
-RULES:
-1. Understand the original meaning before translating.
-2. Write natural Myanmar Burmese as a real Myanmar narrator would speak.
-3. Do not translate word-for-word.
-4. Preserve names, characters, events, facts and event order.
-5. Use correct Myanmar grammar, spelling, vocabulary and sentence structure.
-6. Rewrite awkward expressions into clear, natural Burmese.
-7. Never invent missing events or change the story.
-8. Do not add English explanations, headings, notes or translator comments.
-9. Avoid repeated sentences, broken phrases and unnatural machine translation.
-10. Make sentences easy to understand when spoken aloud.
-11. If a source phrase is unclear, do not guess a new event. Translate only
-    the meaning that can reasonably be understood from the context.
-12. Return only the finished Myanmar narration.
+OUTPUT LANGUAGE:
+Natural, fluent Myanmar Burmese Unicode only.
 
-The final narration must be in Myanmar Burmese Unicode, not English.
+TRANSLATION RULES:
+1. First understand the complete meaning of the Chinese transcript.
+2. Translate the meaning accurately into natural Myanmar Burmese.
+3. Never translate Chinese word-for-word.
+4. Preserve character names, titles, relationships, events,
+   facts, intentions, and the original event order.
+5. Translate Chinese royal titles and forms of address
+   according to context. Do not mechanically repeat titles.
+6. Do not invent dialogue, actions, emotions, or story events.
+7. Do not add details that are absent from the transcript.
+8. Repair awkward Burmese phrasing while preserving meaning.
+9. Use correct Myanmar grammar and natural spoken narration.
+10. Avoid repetitive phrases and literal machine-translation
+    expressions such as unnatural translations of idioms.
+11. If a phrase is genuinely unclear, use a conservative
+    translation rather than guessing.
+12. Return only the final Myanmar Burmese text.
+13. Do not include English, Chinese, explanations, headings,
+    or translator notes in the output.
+
+The result must sound natural when narrated aloud in Myanmar.
 """
-
     if mode != "translate":
         task += (
             "\nWrite in engaging movie recap narration style. "
